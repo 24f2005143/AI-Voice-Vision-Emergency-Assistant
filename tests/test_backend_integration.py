@@ -9,11 +9,12 @@ making a network call would be a bug in the backend.
 import io
 import json
 import logging
+import time
 import unittest
 
 from fastapi.testclient import TestClient
 
-from backend.main import app
+from backend.main import MAX_REQUEST_BYTES, app
 from backend.routes.emergency import get_speech_transcriber, get_vision_analyzer
 from backend.services.orchestrator import (
     AnalysisUnavailableError,
@@ -23,8 +24,15 @@ from backend.services.orchestrator import (
     analyze_emergency,
     clean_transcript,
 )
-from vision.image_analysis import ClaudeVisionAnalyzer, ImageAnalysisError
-from voice.speech_to_text import SpeechmaticsTranscriber, TranscriptionError
+from agent.emergency_agent import CLEAR_HAZARDS as AGENT_CLEAR_HAZARDS
+from agent.emergency_agent import VISION_HAZARDS
+from vision.hazard_detection import CANONICAL_HAZARDS
+from vision.hazard_detection import CLEAR_HAZARDS as VISION_CLEAR_HAZARDS
+from vision.hazard_detection import UNRECOGNIZED_HAZARD, build_result
+from vision.image_analysis import (MAX_IMAGE_BYTES, ClaudeVisionAnalyzer,
+                                   ImageAnalysisError)
+from voice.speech_to_text import (MAX_AUDIO_BYTES, SpeechmaticsTranscriber,
+                                  TranscriptionError)
 
 ENDPOINT = "/api/emergency/analyze"
 EXPECTED_KEYS = {"emergency_type", "severity", "confidence", "reason", "actions"}
@@ -618,6 +626,291 @@ class RejectionTests(BackendTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("actions", response.json())
+
+
+# ---------------------------------------------------------------------------
+# M5.3: unrecognized vision hazards must not read as an all-clear
+# ---------------------------------------------------------------------------
+
+class UnrecognizedHazardTests(BackendTestCase):
+    UNRECOGNIZED = {"hazard": UNRECOGNIZED_HAZARD, "objects": ["water"],
+                    "confidence": 0.9}
+
+    def test_image_only_with_unrecognized_hazard_returns_200(self):
+        self.use_vision(StubAnalyzer(result=dict(self.UNRECOGNIZED)))
+
+        response = self.client.post(ENDPOINT, files=image_upload())
+
+        # Vision succeeded, so this is not an upstream failure (502).
+        self.assertEqual(response.status_code, 200)
+
+    def test_image_only_with_unrecognized_hazard_is_unknown_not_none(self):
+        self.use_vision(StubAnalyzer(result=dict(self.UNRECOGNIZED)))
+
+        body = self.client.post(ENDPOINT, files=image_upload()).json()
+
+        self.assertEqual(body["emergency_type"], "unknown")
+        self.assertNotEqual(body["emergency_type"], "none")
+
+    def test_unrecognized_hazard_response_keeps_the_five_fields(self):
+        self.use_vision(StubAnalyzer(result=dict(self.UNRECOGNIZED)))
+
+        body = self.client.post(ENDPOINT, files=image_upload()).json()
+
+        self.assertEqual(set(body), EXPECTED_KEYS)
+
+    def test_transcript_classification_survives_unrecognized_vision(self):
+        self.use_vision(StubAnalyzer(result=dict(self.UNRECOGNIZED)))
+
+        with_photo = self.client.post(
+            ENDPOINT, data={"transcript": SPOKEN_FIRE}, files=image_upload()
+        ).json()
+        without_photo = self.client.post(
+            ENDPOINT, data={"transcript": SPOKEN_FIRE}
+        ).json()
+
+        self.assertEqual(with_photo["emergency_type"], "possible_fire")
+        self.assertEqual(with_photo["severity"], "high")
+        # No clear-scene penalty: identical to sending no photo at all.
+        self.assertEqual(with_photo["confidence"], without_photo["confidence"])
+        self.assertNotIn("reports no hazard", with_photo["reason"])
+
+    def test_genuine_clear_hazard_still_behaves_as_before(self):
+        self.use_vision(StubAnalyzer(result={"hazard": "none", "objects": [],
+                                             "confidence": 0.9}))
+
+        body = self.client.post(
+            ENDPOINT, data={"transcript": "I smell smoke."}, files=image_upload()
+        ).json()
+
+        self.assertIn("reports no hazard", body["reason"])
+
+    def test_real_normalizer_turns_an_oov_label_into_unknown(self):
+        # End to end through the real vision normalizer, offline.
+        class OovAnalyzer:
+            def analyze(self, image, filename, content_type):
+                return build_result("flooding", ["water"], 0.9)
+
+        self.use_vision(OovAnalyzer())
+
+        body = self.client.post(ENDPOINT, files=image_upload()).json()
+
+        self.assertEqual(body["emergency_type"], "unknown")
+
+    def test_canonical_and_agent_hazard_tables_stay_in_sync(self):
+        self.assertEqual(
+            {k: tuple(v) for k, v in VISION_HAZARDS.items()},
+            {k: tuple(v) for k, v in CANONICAL_HAZARDS.items()},
+        )
+        self.assertEqual(tuple(AGENT_CLEAR_HAZARDS), tuple(VISION_CLEAR_HAZARDS))
+        self.assertNotIn(UNRECOGNIZED_HAZARD, AGENT_CLEAR_HAZARDS)
+        self.assertNotIn(UNRECOGNIZED_HAZARD, VISION_CLEAR_HAZARDS)
+
+
+# ---------------------------------------------------------------------------
+# M5.2: upload limits
+# ---------------------------------------------------------------------------
+
+class UploadLimitTests(BackendTestCase):
+    """Oversized uploads are refused before any provider is called."""
+
+    def test_valid_audio_is_accepted(self):
+        response = self.client.post(ENDPOINT, files=audio_upload(data=b"x" * 2048))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.transcriber.calls), 1)
+
+    def test_valid_image_is_accepted(self):
+        response = self.client.post(ENDPOINT, files=image_upload(data=b"x" * 2048))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.analyzer.calls), 1)
+
+    def test_oversized_audio_returns_413(self):
+        oversized = b"x" * (MAX_AUDIO_BYTES + 1024)
+
+        response = self.client.post(ENDPOINT, files=audio_upload(data=oversized))
+
+        self.assertEqual(response.status_code, 413)
+        # Refused before the provider was reached.
+        self.assertEqual(self.transcriber.calls, [])
+
+    def test_oversized_image_returns_413(self):
+        oversized = b"x" * (MAX_IMAGE_BYTES + 1024)
+
+        response = self.client.post(ENDPOINT, files=image_upload(data=oversized))
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.analyzer.calls, [])
+
+    def test_413_body_is_safe_and_json(self):
+        response = self.client.post(
+            ENDPOINT, files=image_upload(data=b"x" * (MAX_IMAGE_BYTES + 1024))
+        )
+        body = response.json()
+
+        self.assertEqual(set(body), {"detail"})
+        self.assertIsInstance(body["detail"], str)
+
+        lowered = body["detail"].lower()
+
+        for marker in LEAK_MARKERS:
+            self.assertNotIn(marker, lowered)
+
+    def test_413_names_the_published_limit_only(self):
+        response = self.client.post(
+            ENDPOINT, files=audio_upload(data=b"x" * (MAX_AUDIO_BYTES + 1024))
+        )
+
+        self.assertIn("25 MB", response.json()["detail"])
+
+    def test_oversized_audio_does_not_block_a_typed_description(self):
+        # The user is told what to do instead, not just that it failed.
+        response = self.client.post(
+            ENDPOINT, files=audio_upload(data=b"x" * (MAX_AUDIO_BYTES + 1024))
+        )
+
+        self.assertIn("type a short description", response.json()["detail"].lower())
+
+    def test_typed_text_only_is_unaffected_by_the_limits(self):
+        response = self.client.post(ENDPOINT, data={"transcript": SPOKEN_FIRE})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.json()), EXPECTED_KEYS)
+
+    def test_declared_oversized_request_is_refused_before_parsing(self):
+        # Content-Length is checked by middleware ahead of multipart parsing.
+        response = self.client.post(
+            ENDPOINT,
+            content=b"x" * 32,
+            headers={
+                "content-type": "multipart/form-data; boundary=x",
+                "content-length": str(MAX_REQUEST_BYTES + 1),
+            },
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(set(response.json()), {"detail"})
+
+    def test_413_from_middleware_still_carries_cors_headers(self):
+        # CORS is registered outermost so the browser can read the 413 body.
+        response = self.client.post(
+            ENDPOINT,
+            content=b"x" * 32,
+            headers={
+                "origin": "http://localhost:5173",
+                "content-type": "multipart/form-data; boundary=x",
+                "content-length": str(MAX_REQUEST_BYTES + 1),
+            },
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "http://localhost:5173",
+        )
+
+
+# ---------------------------------------------------------------------------
+# M5.2: concurrent speech and vision
+# ---------------------------------------------------------------------------
+
+class ConcurrencyTests(unittest.TestCase):
+    """Independent providers run together without changing any semantics."""
+
+    class Slow:
+        def __init__(self, delay, result):
+            self.delay = delay
+            self.result = result
+            self.calls = 0
+
+        def transcribe(self, audio, filename, content_type, *, language="en"):
+            self.calls += 1
+            time.sleep(self.delay)
+
+            return self.result
+
+        def analyze(self, image, filename, content_type):
+            self.calls += 1
+            time.sleep(self.delay)
+
+            return self.result
+
+    def test_speech_and_vision_overlap(self):
+        stt = self.Slow(0.4, {"transcript": SPOKEN_FIRE})
+        vision = self.Slow(0.4, dict(SMOKE_VISION))
+
+        started = time.perf_counter()
+        analyze_emergency(
+            audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+            image=ImageUpload(IMAGE_BYTES, "a.jpg", "image/jpeg"),
+            transcriber=stt,
+            analyzer=vision,
+        )
+        elapsed = time.perf_counter() - started
+
+        # Sequential would be ~0.8s; overlapping is ~0.4s.
+        self.assertLess(elapsed, 0.7)
+        self.assertEqual(stt.calls, 1)
+        self.assertEqual(vision.calls, 1)
+
+    def test_each_provider_is_still_called_exactly_once(self):
+        stt = StubTranscriber()
+        vision = StubAnalyzer()
+
+        analyze_emergency(
+            audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+            image=ImageUpload(IMAGE_BYTES, "a.jpg", "image/jpeg"),
+            transcriber=stt,
+            analyzer=vision,
+        )
+
+        self.assertEqual(len(stt.calls), 1)
+        self.assertEqual(len(vision.calls), 1)
+
+    def test_failure_in_one_thread_does_not_affect_the_other(self):
+        result = analyze_emergency(
+            audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+            image=ImageUpload(IMAGE_BYTES, "a.jpg", "image/jpeg"),
+            transcriber=StubTranscriber(error=TranscriptionError("down")),
+            analyzer=StubAnalyzer(),
+        )
+
+        # Speech failed in its worker; vision still carried the request.
+        self.assertEqual(result["emergency_type"], "possible_fire")
+        self.assertIn("no supporting description", result["reason"])
+
+    def test_both_failing_concurrently_still_raises_unavailable(self):
+        with self.assertRaises(AnalysisUnavailableError):
+            analyze_emergency(
+                audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+                image=ImageUpload(IMAGE_BYTES, "a.jpg", "image/jpeg"),
+                transcriber=StubTranscriber(error=TranscriptionError("down")),
+                analyzer=StubAnalyzer(error=ImageAnalysisError("down")),
+            )
+
+    def test_transcript_priority_is_preserved_under_concurrency(self):
+        result = analyze_emergency(
+            transcript=TYPED_FALL,
+            audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+            image=ImageUpload(IMAGE_BYTES, "a.jpg", "image/jpeg"),
+            transcriber=StubTranscriber(transcript="There is a fire."),
+            analyzer=StubAnalyzer(),
+        )
+
+        self.assertEqual(result["emergency_type"], "possible_fire")
+
+    def test_no_pool_is_used_when_only_one_input_is_present(self):
+        stt = StubTranscriber()
+
+        result = analyze_emergency(
+            audio=AudioUpload(AUDIO_BYTES, "a.webm", "audio/webm"),
+            transcriber=stt,
+            analyzer=StubAnalyzer(),
+        )
+
+        self.assertEqual(len(stt.calls), 1)
+        self.assertEqual(result["emergency_type"], "possible_fire")
 
 
 # ---------------------------------------------------------------------------

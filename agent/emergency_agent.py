@@ -86,6 +86,12 @@ DISTRESS_MARKERS = ("trapped", "stuck inside", "stuck under", "can't get out",
 # emergency it is, so confidence stays low.
 DISTRESS_CONFIDENCE = 0.4
 
+# A photo that could not be classified carries no information either way, so
+# it is no more certain than having received nothing at all. Any hazard string
+# outside CLEAR_HAZARDS that matches no known vocabulary lands here — the
+# agent never has to know the vision module's sentinel by name.
+UNRECOGNIZED_VISION_CONFIDENCE = 0.2
+
 # Rough danger ordering used only to break voice/vision disagreements.
 # Hand-set for this hackathon MVP; not a validated triage scale.
 RISK_PRIORITY = {
@@ -189,6 +195,12 @@ def analyze(transcript, vision=None):
             confidence *= 0.85
             reason = ("%s, but the image analysis reports no hazard, so the "
                       "two sources disagree." % _describe_transcript(t_words))
+        elif hazard:
+            # Vision answered but the answer could not be classified. That is
+            # not a clear scene, so no disagreement penalty is applied and the
+            # reason must not claim the photo showed nothing wrong.
+            reason = ("%s, and the image analysis could not identify what is "
+                      "in the photo." % _describe_transcript(t_words))
         else:
             reason = ("%s, and no supporting vision result was available."
                       % _describe_transcript(t_words))
@@ -202,6 +214,14 @@ def analyze(transcript, vision=None):
         confidence = DISTRESS_CONFIDENCE
         reason = ("the description reports someone trapped or stuck, but "
                   "neither source shows what kind of emergency it is.")
+    elif hazard and not vision_clear:
+        # A photo was analyzed but nothing in it could be classified, and
+        # there is no description to fall back on. Reporting "none" here
+        # would tell the user the scene is safe when it was never assessed.
+        etype = "unknown"
+        confidence = UNRECOGNIZED_VISION_CONFIDENCE
+        reason = ("the image analysis could not identify what is in the "
+                  "photo, and there is no description to go on.")
     else:
         confidence = 0.7 if (has_transcript and has_vision) else 0.6
         reason = "No emergency indicators were found in the available input."

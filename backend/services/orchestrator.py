@@ -9,6 +9,7 @@ can fail without taking the request down, as long as something usable remains.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 from agent import analyze
@@ -162,6 +163,32 @@ def _run_vision(image, analyzer):
         return None, True
 
 
+def _gather_evidence(audio, image, transcriber, analyzer):
+    """Return ``(spoken_text, vision_result)``.
+
+    Speech and vision are independent blocking HTTP calls on separate client
+    objects, so when both are present they run on two threads and the request
+    costs the slower of the two rather than their sum. Speech alone can poll
+    for ~90s and vision for ~30s, so the saving is real.
+
+    Both helpers swallow their own exceptions and return plain values, so no
+    failure can escape a worker thread and degradation semantics are identical
+    to running them one after the other. When only one input is present no
+    pool is created at all.
+    """
+    if audio is None:
+        return "", _run_vision(image, analyzer)[0]
+
+    if image is None:
+        return _run_stt(audio, transcriber), None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stt_future = pool.submit(_run_stt, audio, transcriber)
+        vision_future = pool.submit(_run_vision, image, analyzer)
+
+        return stt_future.result(), vision_future.result()[0]
+
+
 def _unavailable_message(audio_failed, image_failed):
     if audio_failed and image_failed:
         return BOTH_UNAVAILABLE_MESSAGE
@@ -195,8 +222,7 @@ def analyze_emergency(
     "unknown" assessment, which reads to the user as a real finding.
     """
     typed_text = clean_transcript(transcript)
-    spoken_text = _run_stt(audio, transcriber)
-    vision, _ = _run_vision(image, analyzer)
+    spoken_text, vision = _gather_evidence(audio, image, transcriber, analyzer)
 
     # Speech is primary; typed text is the fallback, never a merge.
     text = spoken_text or typed_text

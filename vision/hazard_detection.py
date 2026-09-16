@@ -52,6 +52,15 @@ HAZARD_SYNONYMS = {
 CLEAR_HAZARDS = ("none", "no hazard", "no_hazard", "nothing", "normal",
                   "safe")
 
+# Returned when the model reported something that cannot be mapped onto a
+# canonical hazard, or reported nothing at all.
+#
+# This is deliberately NOT a member of CLEAR_HAZARDS or CANONICAL_HAZARDS.
+# "we could not classify this photo" and "this photo is safe" are different
+# facts, and collapsing the first into the second turned an unclassified
+# hazard such as flooding into a false all-clear.
+UNRECOGNIZED_HAZARD = "unrecognized"
+
 DEFAULT_CONFIDENCE = 0.5
 
 
@@ -60,11 +69,15 @@ def normalize_hazard(raw_hazard: str | None) -> str:
 
     Returns a lowercase string that is either one of ``CLEAR_HAZARDS``, one
     of the canonical labels the agent's ``VISION_HAZARDS`` table recognizes,
-    or ``"none"`` when nothing usable was detected. Never raises.
+    or ``UNRECOGNIZED_HAZARD`` when the model's answer could not be mapped
+    onto either. Never raises.
+
+    An empty or missing hazard is unrecognized, not clear: the model saying
+    nothing is not the model saying the scene is safe.
     """
     text = str(raw_hazard or "").strip().lower()
     if not text:
-        return "none"
+        return UNRECOGNIZED_HAZARD
     if text in CLEAR_HAZARDS:
         return text
 
@@ -83,7 +96,7 @@ def normalize_hazard(raw_hazard: str | None) -> str:
             if word in text:
                 return word
 
-    return "none"
+    return UNRECOGNIZED_HAZARD
 
 
 def normalize_objects(raw_objects) -> list[str]:
@@ -123,6 +136,10 @@ def build_result(raw_hazard, raw_objects, raw_confidence) -> dict:
     if hazard in CLEAR_HAZARDS:
         # A confirmed "nothing wrong" reading should not carry leftover
         # object detections from an unrelated part of the model's output.
+        #
+        # An UNRECOGNIZED_HAZARD deliberately does not land here: when the
+        # label could not be classified, the objects are the only visual
+        # evidence left and discarding them would throw it away.
         objects = []
     return {
         "hazard": hazard,

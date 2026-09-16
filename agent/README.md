@@ -169,6 +169,10 @@ A `hazard` value of `none`, `no hazard`, `no_hazard`, `nothing`, `normal` or
 `safe` is read as an explicit "nothing is wrong" signal rather than as a
 hazard.
 
+Any other unmatched hazard — including the vision module's `unrecognized`
+sentinel — is treated as **no information**, never as an all-clear. It carries
+no disagreement penalty, and on its own it yields `unknown` rather than `none`.
+
 ### Confidence handling
 
 - **Both sources agree:** confidence combines as
@@ -219,7 +223,7 @@ This ordering is hand-set for the MVP and is not a validated triage scale.
 
 ### Distress and unknown handling
 
-`unknown` is returned in two cases:
+`unknown` is returned in three cases:
 
 1. **No usable input at all** — empty transcript and no vision evidence.
    Confidence `0.2`.
@@ -229,6 +233,10 @@ This ordering is hand-set for the MVP and is not a validated triage scale.
    Confidence `0.4`. The agent reports `unknown` rather than guessing a
    specific type. These phrases are deliberately narrow so that
    *"stuck in traffic"* is not caught.
+3. **A photo that could not be classified, with no transcript** — the hazard
+   is neither a clear value nor a recognised one. Confidence `0.2`. Reporting
+   `none` here would tell the user the scene is safe when it was never
+   actually assessed.
 
 When real evidence identifies a type, that type wins and the distress phrase
 only contributes escalation (see below).
