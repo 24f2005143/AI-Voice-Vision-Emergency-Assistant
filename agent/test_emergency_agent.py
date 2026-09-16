@@ -285,6 +285,77 @@ class FalsePositiveTests(AgentTestCase):
                 self.assertEqual(self.analyze(phrase)["emergency_type"], "none")
 
 
+class UnrecognizedVisionTests(AgentTestCase):
+    """A photo that could not be classified is not a clear scene."""
+
+    UNRECOGNIZED = {"hazard": "unrecognized", "objects": ["water", "person"],
+                    "confidence": 0.9}
+    CLEAR = {"hazard": "none", "objects": [], "confidence": 0.9}
+
+    def test_no_disagreement_penalty_for_unrecognized_vision(self):
+        unrecognized = self.analyze("There is smoke in my kitchen.", self.UNRECOGNIZED)
+        alone = self.analyze("There is smoke in my kitchen.", None)
+
+        # Identical to having no image at all: no 0.85 clear-scene penalty.
+        self.assertEqual(unrecognized["confidence"], alone["confidence"])
+
+    def test_severity_stays_high_with_unrecognized_vision(self):
+        result = self.analyze("There is smoke in my kitchen.", self.UNRECOGNIZED)
+
+        self.assertEqual(result["emergency_type"], "possible_fire")
+        self.assertEqual(result["severity"], "high")
+
+    def test_reason_does_not_claim_the_scene_was_clear(self):
+        result = self.analyze("There is smoke in my kitchen.", self.UNRECOGNIZED)
+
+        self.assertNotIn("reports no hazard", result["reason"])
+        self.assertNotIn("disagree", result["reason"])
+        self.assertIn("could not identify", result["reason"])
+
+    def test_unrecognized_vision_without_transcript_is_unknown(self):
+        result = self.analyze("", self.UNRECOGNIZED)
+
+        self.assertEqual(result["emergency_type"], "unknown")
+
+    def test_unrecognized_vision_without_transcript_is_never_none(self):
+        for hazard in ("unrecognized", "flooding", "a cat on a sofa"):
+            with self.subTest(hazard=hazard):
+                result = self.analyze("", {"hazard": hazard, "objects": [],
+                                           "confidence": 0.9})
+
+                self.assertNotEqual(result["emergency_type"], "none")
+                self.assertEqual(result["emergency_type"], "unknown")
+
+    def test_unknown_from_unrecognized_vision_is_low_confidence(self):
+        result = self.analyze("", self.UNRECOGNIZED)
+
+        self.assertLessEqual(result["confidence"], 0.4)
+        self.assertEqual(result["severity"], "low")
+        self.assertTrue(result["actions"])
+
+    def test_genuine_clear_vision_still_applies_the_disagreement_penalty(self):
+        disagreed = self.analyze("I smell smoke.", self.CLEAR)
+        alone = self.analyze("I smell smoke.", None)
+
+        self.assertLess(disagreed["confidence"], alone["confidence"])
+        self.assertIn("reports no hazard", disagreed["reason"])
+
+    def test_genuine_clear_vision_alone_is_still_no_emergency(self):
+        result = self.analyze("I am making tea.", self.CLEAR)
+
+        self.assertEqual(result["emergency_type"], "none")
+        self.assertEqual(result["actions"], [])
+
+    def test_recognized_vision_is_unaffected(self):
+        result = self.analyze(
+            "There is smoke in my kitchen.",
+            {"hazard": "smoke", "objects": ["stove", "person"], "confidence": 0.89},
+        )
+
+        self.assertEqual(result["emergency_type"], "possible_fire")
+        self.assertGreater(result["confidence"], 0.7)
+
+
 class ContractTests(AgentTestCase):
     """Q-T: confidence bounds, schema, safe wording and determinism."""
 

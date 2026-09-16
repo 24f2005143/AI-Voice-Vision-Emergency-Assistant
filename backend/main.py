@@ -18,8 +18,20 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.routes.emergency import router as emergency_router
+from vision.image_analysis import MAX_IMAGE_BYTES
+from voice.speech_to_text import MAX_AUDIO_BYTES
 
 logger = logging.getLogger(__name__)
+
+# A request may legitimately carry one recording, one photo and a short
+# description, plus multipart overhead. Anything beyond that is refused before
+# the body is parsed, so an oversized upload costs almost nothing.
+MAX_REQUEST_BYTES = MAX_AUDIO_BYTES + MAX_IMAGE_BYTES + (1024 * 1024)
+
+REQUEST_TOO_LARGE_MESSAGE = (
+    "That upload is too large. Please use a recording under 25 MB and a photo "
+    "under 10 MB, or type a short description instead."
+)
 
 # The Vite dev server is reached under both hostnames depending on how the
 # developer opens it, and browsers treat them as separate origins. A wildcard
@@ -42,6 +54,27 @@ app = FastAPI(
     version="0.2.0",
 )
 
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    """Refuse an oversized body before Starlette parses the multipart form.
+
+    Content-Length is advisory, so the per-file caps in the route remain the
+    authoritative check. This only avoids the parsing cost in the obvious case.
+    """
+    declared = request.headers.get("content-length")
+
+    if declared and declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        logger.info("Rejected a request declaring %s bytes", declared)
+
+        return JSONResponse(
+            status_code=413, content={"detail": REQUEST_TOO_LARGE_MESSAGE}
+        )
+
+    return await call_next(request)
+
+
+# Registered last so it sits outermost: every response, including the 413
+# above, then carries the right CORS headers for the browser.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

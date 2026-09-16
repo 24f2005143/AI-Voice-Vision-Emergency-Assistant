@@ -1,7 +1,10 @@
 import unittest
 
-from vision.hazard_detection import (build_result, clamp_confidence,
-                                      normalize_hazard, normalize_objects)
+from agent.emergency_agent import VISION_HAZARDS
+from vision.hazard_detection import (CANONICAL_HAZARDS, CLEAR_HAZARDS,
+                                      UNRECOGNIZED_HAZARD, build_result,
+                                      clamp_confidence, normalize_hazard,
+                                      normalize_objects)
 from vision.image_analysis import ClaudeVisionAnalyzer, ImageAnalysisError
 
 
@@ -15,9 +18,45 @@ class HazardDetectionTests(unittest.TestCase):
         self.assertEqual(normalize_hazard("Safe"), "safe")
         self.assertEqual(normalize_hazard("no hazard"), "no hazard")
 
-    def test_falls_back_to_none_for_unknown_text(self):
-        self.assertEqual(normalize_hazard("a cat sitting on a sofa"), "none")
-        self.assertEqual(normalize_hazard(None), "none")
+    def test_unknown_text_is_unrecognized_not_clear(self):
+        # An unclassifiable hazard must never look like a confirmed all-clear.
+        self.assertEqual(normalize_hazard("flooding"), UNRECOGNIZED_HAZARD)
+        self.assertEqual(
+            normalize_hazard("a cat sitting on a sofa"), UNRECOGNIZED_HAZARD
+        )
+        self.assertEqual(normalize_hazard("gas leak"), UNRECOGNIZED_HAZARD)
+
+    def test_missing_hazard_is_unrecognized_not_clear(self):
+        # The model saying nothing is not the model saying the scene is safe.
+        self.assertEqual(normalize_hazard(None), UNRECOGNIZED_HAZARD)
+        self.assertEqual(normalize_hazard(""), UNRECOGNIZED_HAZARD)
+        self.assertEqual(normalize_hazard("   "), UNRECOGNIZED_HAZARD)
+
+    def test_genuine_clear_labels_are_unchanged(self):
+        self.assertEqual(normalize_hazard("none"), "none")
+        self.assertEqual(normalize_hazard("safe"), "safe")
+        self.assertEqual(normalize_hazard("no hazard"), "no hazard")
+        self.assertEqual(normalize_hazard("nothing"), "nothing")
+
+    def test_sentinel_is_not_clear_and_not_canonical(self):
+        self.assertNotIn(UNRECOGNIZED_HAZARD, CLEAR_HAZARDS)
+
+        for words in CANONICAL_HAZARDS.values():
+            self.assertNotIn(UNRECOGNIZED_HAZARD, words)
+
+    def test_sentinel_does_not_collide_with_agent_vocabulary(self):
+        # The agent matches hazards by substring, so the sentinel must not
+        # accidentally contain a canonical hazard word.
+        for words in VISION_HAZARDS.values():
+            for word in words:
+                self.assertNotIn(word, UNRECOGNIZED_HAZARD)
+
+    def test_build_result_preserves_objects_for_unrecognized_hazard(self):
+        # Objects are the only visual evidence left when the label is unusable.
+        result = build_result("flooding", ["water", "person"], 0.9)
+
+        self.assertEqual(result["hazard"], UNRECOGNIZED_HAZARD)
+        self.assertEqual(result["objects"], ["water", "person"])
 
     def test_normalize_objects_dedupes_and_lowercases(self):
         self.assertEqual(
