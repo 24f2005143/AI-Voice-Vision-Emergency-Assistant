@@ -20,6 +20,7 @@ confidence:     float between 0.0 and 1.0
 actions:        list of complete sentences, empty when emergency_type is none
 """
 
+import math
 import re
 
 SEVERITY_LEVELS = ("low", "medium", "high", "critical")
@@ -246,10 +247,18 @@ def _match_vision(vision):
     raw_objects = vision.get("objects")
     if not isinstance(raw_objects, list):
         raw_objects = []
-    objects = [str(o).strip().lower() for o in raw_objects if str(o).strip()]
+    # Only real labels count. Coercing None or a nested list into text would
+    # invent an object that the vision module never reported, and that text
+    # ends up in the user-facing reason.
+    objects = [str(o).strip().lower() for o in raw_objects
+               if isinstance(o, (str, int, float)) and not isinstance(o, bool)
+               and str(o).strip()]
 
     try:
-        confidence = _clamp(float(vision.get("confidence", 0.5)))
+        raw_confidence = float(vision.get("confidence", 0.5))
+        if not math.isfinite(raw_confidence):
+            raise ValueError("confidence must be a finite number")
+        confidence = _clamp(raw_confidence)
     except (TypeError, ValueError):
         confidence = 0.5
 
